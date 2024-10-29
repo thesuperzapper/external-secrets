@@ -17,7 +17,6 @@ package externalsecret
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -34,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -57,27 +57,26 @@ import (
 )
 
 const (
-	fieldOwnerTemplate      = "externalsecrets.external-secrets.io/%v"
-	errGetES                = "could not get ExternalSecret"
-	errConvert              = "could not apply conversion strategy to keys: %v"
-	errDecode               = "could not apply decoding strategy to %v[%d]: %v"
-	errGenerate             = "could not generate [%d]: %w"
-	errRewrite              = "could not rewrite spec.dataFrom[%d]: %v"
-	errInvalidKeys          = "secret keys from spec.dataFrom.%v[%d] can only have alphanumeric,'-', '_' or '.' characters. Convert them using rewrite (https://external-secrets.io/latest/guides-datafrom-rewrite)"
-	errUpdateSecret         = "could not update Secret"
-	errPatchStatus          = "unable to patch status"
-	errGetExistingSecret    = "could not get existing secret: %w"
-	errSetCtrlReference     = "could not set ExternalSecret controller reference: %w"
-	errFetchTplFrom         = "error fetching templateFrom data: %w"
-	errGetSecretData        = "could not get secret data from provider"
-	errDeleteSecret         = "could not delete secret"
-	errApplyTemplate        = "could not apply template: %w"
-	errExecTpl              = "could not execute template: %w"
-	errInvalidCreatePolicy  = "invalid creationPolicy=%s. Can not delete secret i do not own"
-	errPolicyMergeNotFound  = "the desired secret %s was not found. With creationPolicy=Merge the secret won't be created"
-	errPolicyMergeGetSecret = "unable to get secret %s: %w"
-	errPolicyMergeMutate    = "unable to mutate secret %s: %w"
-	errPolicyMergePatch     = "unable to patch secret %s: %w"
+	fieldOwnerTemplate     = "externalsecrets.external-secrets.io/%v"
+	errGetES               = "could not get ExternalSecret"
+	errConvert             = "could not apply conversion strategy to keys: %v"
+	errDecode              = "could not apply decoding strategy to %v[%d]: %v"
+	errGenerate            = "could not generate [%d]: %w"
+	errRewrite             = "could not rewrite spec.dataFrom[%d]: %v"
+	errInvalidKeys         = "secret keys from spec.dataFrom.%v[%d] can only have alphanumeric,'-', '_' or '.' characters. Convert them using rewrite (https://external-secrets.io/latest/guides-datafrom-rewrite)"
+	errUpdateSecret        = "could not update Secret"
+	errUpdateStatus        = "unable to update status"
+	errGetExistingSecret   = "could not get existing secret: %w"
+	errSetCtrlReference    = "could not set ExternalSecret controller reference: %w"
+	errFetchTplFrom        = "error fetching templateFrom data: %w"
+	errGetSecretData       = "could not get secret data from provider"
+	errDeleteSecret        = "could not delete secret"
+	errApplyTemplate       = "could not apply template: %w"
+	errExecTpl             = "could not execute template: %w"
+	errInvalidCreatePolicy = "invalid creationPolicy=%s. Can not delete secret i do not own"
+	errPolicyMergeNotFound = "the desired secret %s was not found. With creationPolicy=Merge the secret won't be created"
+	errPolicyMergeMutate   = "unable to mutate secret %s: %w"
+	errPolicyMergeUpdate   = "unable to update secret %s: %w"
 )
 
 const externalSecretSecretNameKey = ".spec.target.name"
@@ -98,7 +97,7 @@ type Reconciler struct {
 // Reconcile implements the main reconciliation loop
 // for watched objects (ExternalSecret, ClusterSecretStore and SecretStore),
 // and updates/creates a Kubernetes secret based on them.
-func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, err error) {
 	log := r.Log.WithValues("ExternalSecret", req.NamespacedName)
 
 	resourceLabels := ctrlmetrics.RefineNonConditionMetricLabels(map[string]string{"name": req.Name, "namespace": req.Namespace})
@@ -112,9 +111,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		esmetrics.GetCounterVec(esmetrics.SyncCallsKey).With(resourceLabels).Inc()
 	}()
 
-	var externalSecret esv1beta1.ExternalSecret
-	err := r.Get(ctx, req.NamespacedName, &externalSecret)
-
+	externalSecret := &esv1beta1.ExternalSecret{}
+	err = r.Get(ctx, req.NamespacedName, externalSecret)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			conditionSynced := NewExternalSecretCondition(esv1beta1.ExternalSecretDeleted, v1.ConditionFalse, esv1beta1.ConditionReasonSecretDeleted, "Secret was deleted")
@@ -134,25 +132,36 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	// See https://github.com/external-secrets/external-secrets/issues/3604
-	// We fetch the ExternalSecret resource above, however the status subresource is inconsistent.
-	// We have to explicitly fetch it, otherwise it may be missing and will cause
-	// unexpected side effects.
-	err = r.SubResource("status").Get(ctx, &externalSecret, &externalSecret)
-	if err != nil {
-		log.Error(err, "failed to get status subresource")
-		return ctrl.Result{}, err
+	// skip reconciliation if deletion timestamp is set on external secret
+	if externalSecret.DeletionTimestamp != nil {
+		log.Info("external secret is marked for deletion, skipping reconciliation")
+		return ctrl.Result{}, nil
 	}
+
+	// update status of the ExternalSecret when this function returns, if needed.
+	// we use the ability of deferred functions to update named return values `result` and `err`.
+	currentStatus := externalSecret.Status.DeepCopy()
+	defer func() {
+		if !equality.Semantic.DeepEqual(currentStatus, externalSecret.Status) {
+			if updateErr := r.Status().Update(ctx, externalSecret); updateErr != nil {
+				if apierrors.IsConflict(updateErr) {
+					log.V(1).Info("conflict while updating status, will requeue")
+					result = ctrl.Result{Requeue: true}
+					return
+				}
+				log.Error(updateErr, errUpdateStatus)
+				if err == nil {
+					err = updateErr
+				} else {
+					err = fmt.Errorf("%w: %v", updateErr, err)
+				}
+			}
+		}
+	}()
 
 	timeSinceLastRefresh := 0 * time.Second
 	if !externalSecret.Status.RefreshTime.IsZero() {
 		timeSinceLastRefresh = time.Since(externalSecret.Status.RefreshTime.Time)
-	}
-
-	// skip reconciliation if deletion timestamp is set on external secret
-	if externalSecret.DeletionTimestamp != nil {
-		log.Info("skipping as it is in deletion")
-		return ctrl.Result{}, nil
 	}
 
 	// if extended metrics is enabled, refine the time series vector
@@ -181,12 +190,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		secretName = externalSecret.ObjectMeta.Name
 	}
 
-	// fetch external secret, we need to ensure that it exists, and it's hashmap corresponds
-	var existingSecret v1.Secret
-	err = r.Get(ctx, types.NamespacedName{
-		Name:      secretName,
-		Namespace: externalSecret.Namespace,
-	}, &existingSecret)
+	// fetch existing secret
+	existingSecret := &v1.Secret{}
+	err = r.Get(ctx, client.ObjectKey{Name: secretName, Namespace: externalSecret.Namespace}, existingSecret)
 	if err != nil && !apierrors.IsNotFound(err) {
 		log.Error(err, errGetExistingSecret)
 		return ctrl.Result{}, err
@@ -201,42 +207,29 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		log.V(1).Info("skipping refresh", "rv", getResourceVersion(externalSecret), "nr", refreshInt.Seconds())
 		return ctrl.Result{RequeueAfter: refreshInt}, nil
 	}
-	if !shouldReconcile(externalSecret) {
+	if !shouldReconcile(externalSecret, existingSecret) {
 		log.V(1).Info("stopping reconciling", "rv", getResourceVersion(externalSecret))
 		return ctrl.Result{}, nil
 	}
 
-	// patch status when done processing
-	p := client.MergeFrom(externalSecret.DeepCopy())
-	defer func() {
-		err = r.Status().Patch(ctx, &externalSecret, p)
-		if err != nil {
-			log.Error(err, errPatchStatus)
-		}
-	}()
-
-	secret := &v1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: externalSecret.Namespace,
-		},
-		Immutable: &externalSecret.Spec.Target.Immutable,
-		Data:      make(map[string][]byte),
-	}
-
-	dataMap, err := r.getProviderSecretData(ctx, &externalSecret)
+	dataMap, err := r.getProviderSecretData(ctx, externalSecret)
 	if err != nil {
-		r.markAsFailed(log, errGetSecretData, err, &externalSecret, syncCallsError.With(resourceLabels))
+		r.markAsFailed(log, errGetSecretData, err, externalSecret, syncCallsError.With(resourceLabels))
 		return ctrl.Result{}, err
 	}
 
+	//
+	// TODO: there are no cases where `err` is not nil, so this does nothing.
+	//       this code was added in https://github.com/external-secrets/external-secrets/pull/3746
+	//       so if that is real, we should move this code to somewhere else
+	//
 	// secret data was not modified.
-	if errors.Is(err, esv1beta1.NotModifiedErr) {
-		log.Info("secret was not modified as a NotModified was returned by the provider")
-		r.markAsDone(&externalSecret, start, log)
-
-		return ctrl.Result{}, nil
-	}
+	//if errors.Is(err, esv1beta1.NotModifiedErr) {
+	//	log.Info("secret was not modified as a NotModified was returned by the provider")
+	//	r.markAsDone(externalSecret, start, log)
+	//
+	//	return ctrl.Result{}, nil
+	//}
 
 	// if no data was found we can delete the secret if needed.
 	if len(dataMap) == 0 {
@@ -247,30 +240,34 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			// this is also implemented in the es validation webhook
 			if externalSecret.Spec.Target.CreationPolicy != esv1beta1.CreatePolicyOwner {
 				err := fmt.Errorf(errInvalidCreatePolicy, externalSecret.Spec.Target.CreationPolicy)
-				r.markAsFailed(log, errDeleteSecret, err, &externalSecret, syncCallsError.With(resourceLabels))
+				r.markAsFailed(log, errDeleteSecret, err, externalSecret, syncCallsError.With(resourceLabels))
 				return ctrl.Result{}, err
 			}
 
-			if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
-				r.markAsFailed(log, errDeleteSecret, err, &externalSecret, syncCallsError.With(resourceLabels))
-				return ctrl.Result{}, err
+			// delete the secret, if it exists
+			if existingSecret.UID != "" {
+				if err := r.Delete(ctx, existingSecret); err != nil && !apierrors.IsNotFound(err) {
+					r.markAsFailed(log, errDeleteSecret, err, externalSecret, syncCallsError.With(resourceLabels))
+					return ctrl.Result{}, err
+				}
 			}
 
 			conditionSynced := NewExternalSecretCondition(esv1beta1.ExternalSecretReady, v1.ConditionTrue, esv1beta1.ConditionReasonSecretDeleted, "secret deleted due to DeletionPolicy")
-			SetExternalSecretCondition(&externalSecret, *conditionSynced)
+			SetExternalSecretCondition(externalSecret, *conditionSynced)
 			return ctrl.Result{RequeueAfter: refreshInt}, nil
 		// In case provider secrets don't exist the kubernetes secret will be kept as-is.
 		case esv1beta1.DeletionPolicyRetain:
-			r.markAsDone(&externalSecret, start, log)
+			r.markAsDone(externalSecret, start, log)
 			return ctrl.Result{RequeueAfter: refreshInt}, nil
 		// noop, handled below
 		case esv1beta1.DeletionPolicyMerge:
 		}
 	}
 
-	mutationFunc := func() error {
+	// mutationFunc is a function which can be applied to a secret to make it match the desired state.
+	mutationFunc := func(secret *v1.Secret) error {
 		if externalSecret.Spec.Target.CreationPolicy == esv1beta1.CreatePolicyOwner {
-			err = controllerutil.SetControllerReference(&externalSecret, &secret.ObjectMeta, r.Scheme)
+			err = controllerutil.SetControllerReference(externalSecret, secret, r.Scheme)
 			if err != nil {
 				return fmt.Errorf(errSetCtrlReference, err)
 			}
@@ -278,65 +275,77 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if secret.Data == nil {
 			secret.Data = make(map[string][]byte)
 		}
-		// diff existing keys
-		keys, err := getManagedDataKeys(&existingSecret, externalSecret.Name)
+
+		// get the list of keys that are managed by this ExternalSecret
+		keys, err := getManagedDataKeys(secret, externalSecret.Name)
 		if err != nil {
 			return err
 		}
-		// Sanitize data map for any updates on the ES
+
+		// remove any data keys that are managed by this ExternalSecret, so we can re-add them
+		// this ensures keys added by templates are not left behind when they are removed from the template
 		for _, key := range keys {
-			if dataMap[key] == nil {
-				secret.Data[key] = nil
-				// Sanitizing any templated / updated keys
-				delete(secret.Data, key)
-			}
+			delete(secret.Data, key)
 		}
-		err = r.applyTemplate(ctx, &externalSecret, secret, dataMap)
+
+		err = r.applyTemplate(ctx, externalSecret, secret, dataMap)
 		if err != nil {
 			return fmt.Errorf(errApplyTemplate, err)
 		}
+
+		// set the immutable flag on the secret if requested by the ExternalSecret
+		if externalSecret.Spec.Target.Immutable {
+			secret.Immutable = ptr.To(true)
+		}
+
 		if externalSecret.Spec.Target.CreationPolicy == esv1beta1.CreatePolicyOwner {
 			lblValue := utils.ObjectHash(fmt.Sprintf("%v/%v", externalSecret.Namespace, externalSecret.Name))
 			secret.Labels[esv1beta1.LabelOwner] = lblValue
 		}
 
-		secret.Annotations[esv1beta1.AnnotationDataHash] = r.computeDataHashAnnotation(&existingSecret, secret)
+		secret.Annotations[esv1beta1.AnnotationDataHash] = utils.ObjectHash(secret.Data)
 
 		return nil
 	}
 
 	switch externalSecret.Spec.Target.CreationPolicy { //nolint:exhaustive
 	case esv1beta1.CreatePolicyMerge:
-		err = r.patchSecret(ctx, secret, mutationFunc, &externalSecret)
+		err = r.patchSecret(ctx, existingSecret, mutationFunc, externalSecret)
 		if err == nil {
-			externalSecret.Status.Binding = v1.LocalObjectReference{Name: secret.Name}
+			externalSecret.Status.Binding = v1.LocalObjectReference{Name: secretName}
 		}
 	case esv1beta1.CreatePolicyNone:
 		log.V(1).Info("secret creation skipped due to creationPolicy=None")
 		err = nil
 	default:
 		var created bool
-		created, err = r.createOrUpdateSecret(ctx, secret, mutationFunc, &externalSecret)
+		created, err = r.createOrUpdateSecret(ctx, existingSecret, mutationFunc, externalSecret, secretName)
 		if err == nil {
-			externalSecret.Status.Binding = v1.LocalObjectReference{Name: secret.Name}
+			externalSecret.Status.Binding = v1.LocalObjectReference{Name: secretName}
 		}
 		// cleanup orphaned secrets
 		if created {
-			delErr := deleteOrphanedSecrets(ctx, r.Client, &externalSecret)
+			delErr := deleteOrphanedSecrets(ctx, r.Client, externalSecret)
 			if delErr != nil {
 				msg := fmt.Sprintf("failed to clean up orphaned secrets: %v", delErr)
-				r.markAsFailed(log, msg, delErr, &externalSecret, syncCallsError.With(resourceLabels))
+				r.markAsFailed(log, msg, delErr, externalSecret, syncCallsError.With(resourceLabels))
 				return ctrl.Result{}, delErr
 			}
 		}
 	}
 
 	if err != nil {
-		r.markAsFailed(log, errUpdateSecret, err, &externalSecret, syncCallsError.With(resourceLabels))
+		// if we got an update conflict, we should requeue immediately
+		if apierrors.IsConflict(err) {
+			log.V(1).Info("conflict while updating secret, will requeue")
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		r.markAsFailed(log, errUpdateSecret, err, externalSecret, syncCallsError.With(resourceLabels))
 		return ctrl.Result{}, err
 	}
 
-	r.markAsDone(&externalSecret, start, log)
+	r.markAsDone(externalSecret, start, log)
 
 	return ctrl.Result{
 		RequeueAfter: refreshInt,
@@ -348,7 +357,7 @@ func (r *Reconciler) markAsDone(externalSecret *esv1beta1.ExternalSecret, start 
 	currCond := GetExternalSecretCondition(externalSecret.Status, esv1beta1.ExternalSecretReady)
 	SetExternalSecretCondition(externalSecret, *conditionSynced)
 	externalSecret.Status.RefreshTime = metav1.NewTime(start)
-	externalSecret.Status.SyncedResourceVersion = getResourceVersion(*externalSecret)
+	externalSecret.Status.SyncedResourceVersion = getResourceVersion(externalSecret)
 	if currCond == nil || currCond.Status != conditionSynced.Status {
 		log.Info("reconciled secret") // Log once if on success in any verbosity
 	} else {
@@ -391,82 +400,92 @@ func deleteOrphanedSecrets(ctx context.Context, cl client.Client, externalSecret
 	return nil
 }
 
-func (r *Reconciler) createOrUpdateSecret(ctx context.Context, secret *v1.Secret, mutationFunc func() error, es *esv1beta1.ExternalSecret) (bool, error) {
+func (r *Reconciler) createOrUpdateSecret(ctx context.Context, existingSecret *v1.Secret, mutationFunc func(secret *v1.Secret) error, es *esv1beta1.ExternalSecret, secretName string) (bool, error) {
 	fqdn := fmt.Sprintf(fieldOwnerTemplate, es.Name)
-	key := client.ObjectKeyFromObject(secret)
-	if err := r.Client.Get(ctx, key, secret); err != nil {
-		if !apierrors.IsNotFound(err) {
+
+	// if the secret does not exist, create it
+	if existingSecret.UID == "" {
+
+		// define and mutate the new secret
+		newSecret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: es.Namespace,
+			},
+			Data: make(map[string][]byte),
+		}
+		if err := mutationFunc(newSecret); err != nil {
 			return false, err
 		}
-		if err := mutationFunc(); err != nil {
+
+		// note, we set field owner even for Create
+		if err := r.Create(ctx, newSecret, client.FieldOwner(fqdn)); err != nil {
 			return false, err
 		}
-		// Setting Field Owner even for CreationPolicy==Create
-		if err := r.Client.Create(ctx, secret, client.FieldOwner(fqdn)); err != nil {
-			return false, err
-		}
+
 		r.recorder.Event(es, v1.EventTypeNormal, esv1beta1.ReasonCreated, "Created Secret")
 		return true, nil
 	}
 
-	existing := secret.DeepCopyObject()
-	if err := mutationFunc(); err != nil {
+	// mutate a copy of the existing secret with the mutation function
+	updatedSecret := existingSecret.DeepCopy()
+	if err := mutationFunc(updatedSecret); err != nil {
 		return false, err
 	}
 
-	if equality.Semantic.DeepEqual(existing, secret) {
+	// if the secret does not need to be updated, return early
+	if equality.Semantic.DeepEqual(existingSecret, updatedSecret) {
 		return false, nil
 	}
 
-	if err := r.Client.Update(ctx, secret, client.FieldOwner(fqdn)); err != nil {
-		return false, err
+	// update the secret
+	if err := r.Update(ctx, updatedSecret, client.FieldOwner(fqdn)); err != nil {
+		// if we get a conflict, we should return early to requeue immediately
+		// note, we don't wrap this error so we can handle it in the caller
+		if apierrors.IsConflict(err) {
+			return false, err
+		}
+		return false, err // might be wrapped in future
 	}
+
 	r.recorder.Event(es, v1.EventTypeNormal, esv1beta1.ReasonUpdated, "Updated Secret")
 	return false, nil
 }
 
-func (r *Reconciler) patchSecret(ctx context.Context, secret *v1.Secret, mutationFunc func() error, es *esv1beta1.ExternalSecret) error {
+func (r *Reconciler) patchSecret(ctx context.Context, existingSecret *v1.Secret, mutationFunc func(secret *v1.Secret) error, es *esv1beta1.ExternalSecret) error {
 	fqdn := fmt.Sprintf(fieldOwnerTemplate, es.Name)
-	err := r.Client.Get(ctx, client.ObjectKeyFromObject(secret), secret.DeepCopy())
-	if apierrors.IsNotFound(err) {
-		return fmt.Errorf(errPolicyMergeNotFound, secret.Name)
-	}
-	if err != nil {
-		return fmt.Errorf(errPolicyMergeGetSecret, secret.Name, err)
+
+	// fail if the secret does not exist
+	if existingSecret.UID == "" {
+		return fmt.Errorf(errPolicyMergeNotFound, existingSecret.Name)
 	}
 
-	existing := secret.DeepCopyObject()
-	if err = mutationFunc(); err != nil {
-		return fmt.Errorf(errPolicyMergeMutate, secret.Name, err)
+	// mutate a copy of the existing secret with the mutation function
+	updatedSecret := existingSecret.DeepCopy()
+	if err := mutationFunc(updatedSecret); err != nil {
+		return fmt.Errorf(errPolicyMergeMutate, updatedSecret.Name, err)
 	}
 
-	// GVK is missing in the Secret, see:
-	// https://github.com/kubernetes-sigs/controller-runtime/issues/526
-	// https://github.com/kubernetes-sigs/controller-runtime/issues/1517
-	// https://github.com/kubernetes/kubernetes/issues/80609
-	// we need to manually set it before doing a Patch() as it depends on the GVK
-	gvks, unversioned, err := r.Scheme.ObjectKinds(secret)
-	if err != nil {
-		return err
-	}
-	if !unversioned && len(gvks) == 1 {
-		secret.SetGroupVersionKind(gvks[0])
-	}
-
-	if equality.Semantic.DeepEqual(existing, secret) {
+	// if the secret does not need to be updated, return early
+	if equality.Semantic.DeepEqual(existingSecret, updatedSecret) {
 		return nil
 	}
-	// Cleaning up Managed fields manually as to keep patch coherence
-	secret.ObjectMeta.ManagedFields = nil
-	// we're not able to resolve conflicts so we force ownership
-	// see: https://kubernetes.io/docs/reference/using-api/server-side-apply/#using-server-side-apply-in-a-controller
-	if err := r.Client.Patch(ctx, secret, client.Apply, client.FieldOwner(fqdn), client.ForceOwnership); err != nil {
-		return fmt.Errorf(errPolicyMergePatch, secret.Name, err)
+
+	// update the secret
+	if err := r.Update(ctx, updatedSecret, client.FieldOwner(fqdn)); err != nil {
+		// if we get a conflict, we should return early to requeue immediately
+		// note, we don't wrap this error so we can handle it in the caller
+		if apierrors.IsConflict(err) {
+			return err
+		}
+		return fmt.Errorf(errPolicyMergeUpdate, updatedSecret.Name, err)
 	}
+
 	r.recorder.Event(es, v1.EventTypeNormal, esv1beta1.ReasonUpdated, "Updated Secret")
 	return nil
 }
 
+// getManagedDataKeys returns the list of data keys in a secret which are managed by a specified owner.
 func getManagedDataKeys(secret *v1.Secret, fieldOwner string) ([]string, error) {
 	return getManagedFieldKeys(secret, fieldOwner, func(fields map[string]any) []string {
 		dataFields := fields["f:data"]
@@ -508,7 +527,7 @@ func getManagedFieldKeys(
 	return keys, nil
 }
 
-func getResourceVersion(es esv1beta1.ExternalSecret) string {
+func getResourceVersion(es *esv1beta1.ExternalSecret) string {
 	return fmt.Sprintf("%d-%s", es.ObjectMeta.GetGeneration(), hashMeta(es.ObjectMeta))
 }
 
@@ -523,14 +542,14 @@ func hashMeta(m metav1.ObjectMeta) string {
 	})
 }
 
-func shouldSkipClusterSecretStore(r *Reconciler, es esv1beta1.ExternalSecret) bool {
+func shouldSkipClusterSecretStore(r *Reconciler, es *esv1beta1.ExternalSecret) bool {
 	return !r.ClusterSecretStoreEnabled && es.Spec.SecretStoreRef.Kind == esv1beta1.ClusterSecretStoreKind
 }
 
 // shouldSkipUnmanagedStore iterates over all secretStore references in the externalSecret spec,
 // fetches the store and evaluates the controllerClass property.
 // Returns true if any storeRef points to store with a non-matching controllerClass.
-func shouldSkipUnmanagedStore(ctx context.Context, namespace string, r *Reconciler, es esv1beta1.ExternalSecret) (bool, error) {
+func shouldSkipUnmanagedStore(ctx context.Context, namespace string, r *Reconciler, es *esv1beta1.ExternalSecret) (bool, error) {
 	var storeList []esv1beta1.SecretStoreRef
 
 	if es.Spec.SecretStoreRef.Name != "" {
@@ -575,7 +594,7 @@ func shouldSkipUnmanagedStore(ctx context.Context, namespace string, r *Reconcil
 			namespace = ""
 		}
 
-		err := r.Client.Get(ctx, types.NamespacedName{
+		err := r.Get(ctx, types.NamespacedName{
 			Name:      ref.Name,
 			Namespace: namespace,
 		}, store)
@@ -590,7 +609,7 @@ func shouldSkipUnmanagedStore(ctx context.Context, namespace string, r *Reconcil
 	return false, nil
 }
 
-func shouldRefresh(es esv1beta1.ExternalSecret) bool {
+func shouldRefresh(es *esv1beta1.ExternalSecret) bool {
 	// refresh if resource version changed
 	if es.Status.SyncedResourceVersion != getResourceVersion(es) {
 		return true
@@ -606,14 +625,15 @@ func shouldRefresh(es esv1beta1.ExternalSecret) bool {
 	return es.Status.RefreshTime.Add(es.Spec.RefreshInterval.Duration).Before(time.Now())
 }
 
-func shouldReconcile(es esv1beta1.ExternalSecret) bool {
-	if es.Spec.Target.Immutable && hasSyncedCondition(es) {
+func shouldReconcile(es *esv1beta1.ExternalSecret, existingSecret *v1.Secret) bool {
+	// we can't reconcile if the secret already exists and is immutable
+	if existingSecret.Immutable != nil && *existingSecret.Immutable {
 		return false
 	}
 	return true
 }
 
-func hasSyncedCondition(es esv1beta1.ExternalSecret) bool {
+func hasSyncedCondition(es *esv1beta1.ExternalSecret) bool {
 	for _, condition := range es.Status.Conditions {
 		if condition.Reason == "SecretSynced" {
 			return true
@@ -623,8 +643,8 @@ func hasSyncedCondition(es esv1beta1.ExternalSecret) bool {
 }
 
 // isSecretValid checks if the secret exists, and it's data is consistent with the calculated hash.
-func isSecretValid(existingSecret v1.Secret) bool {
-	// if target secret doesn't exist, or annotations as not set, we need to refresh
+func isSecretValid(existingSecret *v1.Secret) bool {
+	// if target secret doesn't exist, or annotations are not set, we need to refresh
 	if existingSecret.UID == "" || existingSecret.Annotations == nil {
 		return false
 	}
@@ -634,15 +654,6 @@ func isSecretValid(existingSecret v1.Secret) bool {
 		return false
 	}
 	return true
-}
-
-// computeDataHashAnnotation generate a hash of the secret data combining the old key with the new keys to add or override.
-func (r *Reconciler) computeDataHashAnnotation(existing, secret *v1.Secret) string {
-	data := make(map[string][]byte)
-	maps.Insert(data, maps.All(existing.Data))
-	maps.Insert(data, maps.All(secret.Data))
-
-	return utils.ObjectHash(data)
 }
 
 // SetupWithManager returns a new controller builder that will be started by the provided Manager.
