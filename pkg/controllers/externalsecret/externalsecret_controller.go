@@ -117,6 +117,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	err = r.Get(ctx, req.NamespacedName, externalSecret)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+			// NOTE: this does not actually set the condition on the ExternalSecret, because it does not exist
+			//       this is a hack to disable metrics for deleted ExternalSecrets, see:
+			//       https://github.com/external-secrets/external-secrets/pull/612
 			conditionSynced := NewExternalSecretCondition(esv1beta1.ExternalSecretDeleted, v1.ConditionFalse, esv1beta1.ConditionReasonSecretDeleted, "Secret was deleted")
 			SetExternalSecretCondition(&esv1beta1.ExternalSecret{
 				ObjectMeta: metav1.ObjectMeta{
@@ -161,11 +164,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 	}()
 
-	timeSinceLastRefresh := 0 * time.Second
-	if !externalSecret.Status.RefreshTime.IsZero() {
-		timeSinceLastRefresh = time.Since(externalSecret.Status.RefreshTime.Time)
-	}
-
 	// if extended metrics is enabled, refine the time series vector
 	resourceLabels = ctrlmetrics.RefineLabels(resourceLabels, externalSecret.Labels)
 
@@ -179,11 +177,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	if skip {
 		log.Info("skipping unmanaged store as it points to a unmanaged controllerClass")
 		return ctrl.Result{}, nil
-	}
-
-	refreshInt := r.RequeueInterval
-	if externalSecret.Spec.RefreshInterval != nil {
-		refreshInt = externalSecret.Spec.RefreshInterval.Duration
 	}
 
 	// Target Secret Name should default to the ExternalSecret name if not explicitly specified
@@ -200,14 +193,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, err
 	}
 
-	// refresh should be skipped if
-	// 1. resource generation hasn't changed
-	// 2. refresh interval is 0
-	// 3. if we're still within refresh-interval
+	// refresh will be skipped if ALL the following conditions are met:
+	// 1. refresh interval is not 0
+	// 2. resource generation of the ExternalSecret has not changed
+	// 3. the last refresh time of the ExternalSecret is within the refresh interval
+	// 5. the target secret is valid:
+	//     - it exists
+	//     - it has the correct data-hash annotation
 	if !shouldRefresh(externalSecret) && isSecretValid(existingSecret) {
-		refreshInt = (externalSecret.Spec.RefreshInterval.Duration - timeSinceLastRefresh) + 5*time.Second
-		log.V(1).Info("skipping refresh", "rv", getResourceVersion(externalSecret), "nr", refreshInt.Seconds())
-		return ctrl.Result{RequeueAfter: refreshInt}, nil
+		log.V(1).Info("skipping refresh")
+		return r.getRequeueResult(externalSecret), nil
 	}
 
 	dataMap, err := r.getProviderSecretData(ctx, externalSecret)
@@ -250,13 +245,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 				}
 			}
 
-			conditionSynced := NewExternalSecretCondition(esv1beta1.ExternalSecretReady, v1.ConditionTrue, esv1beta1.ConditionReasonSecretDeleted, "secret deleted due to DeletionPolicy")
-			SetExternalSecretCondition(externalSecret, *conditionSynced)
-			return ctrl.Result{RequeueAfter: refreshInt}, nil
+			r.markAsDone(externalSecret, start, log, true)
+			return r.getRequeueResult(externalSecret), nil
 		// In case provider secrets don't exist the kubernetes secret will be kept as-is.
 		case esv1beta1.DeletionPolicyRetain:
-			r.markAsDone(externalSecret, start, log)
-			return ctrl.Result{RequeueAfter: refreshInt}, nil
+			r.markAsDone(externalSecret, start, log, false)
+			return r.getRequeueResult(externalSecret), nil
 		// noop, handled below
 		case esv1beta1.DeletionPolicyMerge:
 		}
@@ -343,23 +337,69 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, err
 	}
 
-	r.markAsDone(externalSecret, start, log)
-
-	return ctrl.Result{
-		RequeueAfter: refreshInt,
-	}, nil
+	r.markAsDone(externalSecret, start, log, false)
+	return r.getRequeueResult(externalSecret), nil
 }
 
-func (r *Reconciler) markAsDone(externalSecret *esv1beta1.ExternalSecret, start time.Time, log logr.Logger) {
-	conditionSynced := NewExternalSecretCondition(esv1beta1.ExternalSecretReady, v1.ConditionTrue, esv1beta1.ConditionReasonSecretSynced, "Secret was synced")
-	currCond := GetExternalSecretCondition(externalSecret.Status, esv1beta1.ExternalSecretReady)
-	SetExternalSecretCondition(externalSecret, *conditionSynced)
+// getRequeueResult create a result with requeueAfter based on the ExternalSecret refresh interval.
+// this should be used when the ExternalSecret has been SUCCESSFULLY reconciled,
+// and ONLY AFTER `markAsDone()` has been called.
+func (r *Reconciler) getRequeueResult(externalSecret *esv1beta1.ExternalSecret) ctrl.Result {
+	// default to the global requeue interval
+	// note, this will never be used because the CRD has a default value of 1 hour
+	refreshInterval := r.RequeueInterval
+	if externalSecret.Spec.RefreshInterval != nil {
+		refreshInterval = externalSecret.Spec.RefreshInterval.Duration
+	}
+
+	// if the refresh interval is <= 0, we should not requeue
+	if refreshInterval <= 0 {
+		return ctrl.Result{}
+	}
+
+	timeSinceLastRefresh := 0 * time.Second
+	if !externalSecret.Status.RefreshTime.IsZero() {
+		lastRefreshTime := externalSecret.Status.RefreshTime.Time
+		timeSinceLastRefresh = time.Since(lastRefreshTime)
+	}
+
+	// if the last refresh time is in the future, we should requeue immediately
+	if timeSinceLastRefresh < 0 {
+		return ctrl.Result{Requeue: true}
+	}
+
+	if timeSinceLastRefresh < refreshInterval {
+		// requeue after the remaining time
+		return ctrl.Result{RequeueAfter: refreshInterval - timeSinceLastRefresh}
+	} else {
+		// requeue immediately
+		return ctrl.Result{Requeue: true}
+	}
+}
+
+func (r *Reconciler) markAsDone(externalSecret *esv1beta1.ExternalSecret, start time.Time, log logr.Logger, wasDeleted bool) {
+	oldReadyCondition := GetExternalSecretCondition(externalSecret.Status, esv1beta1.ExternalSecretReady)
+	var newReadyCondition *esv1beta1.ExternalSecretStatusCondition
+	if wasDeleted {
+		newReadyCondition = NewExternalSecretCondition(esv1beta1.ExternalSecretReady, v1.ConditionTrue, esv1beta1.ConditionReasonSecretDeleted, "secret deleted due to DeletionPolicy")
+		SetExternalSecretCondition(externalSecret, *newReadyCondition)
+	} else {
+		newReadyCondition = NewExternalSecretCondition(esv1beta1.ExternalSecretReady, v1.ConditionTrue, esv1beta1.ConditionReasonSecretSynced, "Secret was synced")
+		SetExternalSecretCondition(externalSecret, *newReadyCondition)
+	}
+
 	externalSecret.Status.RefreshTime = metav1.NewTime(start)
 	externalSecret.Status.SyncedResourceVersion = getResourceVersion(externalSecret)
-	if currCond == nil || currCond.Status != conditionSynced.Status {
-		log.Info("reconciled secret") // Log once if on success in any verbosity
+
+	// if the status or reason has changed, log at the appropriate verbosity level
+	if oldReadyCondition == nil || oldReadyCondition.Status != newReadyCondition.Status || oldReadyCondition.Reason != newReadyCondition.Reason {
+		if wasDeleted {
+			log.Info("deleted secret")
+		} else {
+			log.Info("reconciled secret")
+		}
 	} else {
-		log.V(1).Info("reconciled secret") // Log all reconciliation cycles if higher verbosity applied
+		log.V(1).Info("reconciled secret")
 	}
 }
 
@@ -598,18 +638,22 @@ func shouldSkipUnmanagedStore(ctx context.Context, namespace string, r *Reconcil
 }
 
 func shouldRefresh(es *esv1beta1.ExternalSecret) bool {
-	// refresh if resource version changed
+	// if the refresh interval is 0, and we have synced previously, we should not refresh
+	if es.Spec.RefreshInterval.Duration <= 0 && es.Status.SyncedResourceVersion != "" {
+		return false
+	}
+
+	// if the ExternalSecret has been updated, we should refresh
 	if es.Status.SyncedResourceVersion != getResourceVersion(es) {
 		return true
 	}
 
-	// skip refresh if refresh interval is 0
-	if es.Spec.RefreshInterval.Duration == 0 && es.Status.SyncedResourceVersion != "" {
-		return false
-	}
+	// if the last refresh time is zero, we should refresh
 	if es.Status.RefreshTime.IsZero() {
 		return true
 	}
+
+	// if the last refresh time + refresh interval is before now, we should refresh
 	return es.Status.RefreshTime.Add(es.Spec.RefreshInterval.Duration).Before(time.Now())
 }
 
@@ -625,6 +669,7 @@ func isSecretValid(existingSecret *v1.Secret) bool {
 	if existingSecret.Annotations[esv1beta1.AnnotationDataHash] != utils.ObjectHash(existingSecret.Data) {
 		return false
 	}
+
 	return true
 }
 
