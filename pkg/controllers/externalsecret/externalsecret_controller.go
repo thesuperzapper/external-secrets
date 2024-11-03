@@ -73,6 +73,7 @@ const (
 	errFetchTplFrom        = "error fetching templateFrom data: %w"
 	errGetSecretData       = "could not get secret data from provider"
 	errDeleteSecret        = "could not delete secret"
+	errDeleteOrphaned      = "could not delete orphaned secrets"
 	errApplyTemplate       = "could not apply template: %w"
 	errExecTpl             = "could not execute template: %w"
 	errInvalidCreatePolicy = "invalid creationPolicy=%s. Can not delete secret i do not own"
@@ -143,27 +144,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		return ctrl.Result{}, nil
 	}
 
-	// update status of the ExternalSecret when this function returns, if needed.
-	// we use the ability of deferred functions to update named return values `result` and `err`.
-	currentStatus := externalSecret.Status.DeepCopy()
-	defer func() {
-		if !equality.Semantic.DeepEqual(currentStatus, externalSecret.Status) {
-			if updateErr := r.Status().Update(ctx, externalSecret); updateErr != nil {
-				if apierrors.IsConflict(updateErr) {
-					log.V(1).Info("conflict while updating status, will requeue")
-					result = ctrl.Result{Requeue: true}
-					return
-				}
-				log.Error(updateErr, errUpdateStatus)
-				if err == nil {
-					err = updateErr
-				} else {
-					err = fmt.Errorf("%w: %v", updateErr, err)
-				}
-			}
-		}
-	}()
-
 	// if extended metrics is enabled, refine the time series vector
 	resourceLabels = ctrlmetrics.RefineLabels(resourceLabels, externalSecret.Labels)
 
@@ -204,6 +184,29 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		log.V(1).Info("skipping refresh")
 		return r.getRequeueResult(externalSecret), nil
 	}
+
+	// update status of the ExternalSecret when this function returns, if needed.
+	// we use the ability of deferred functions to update named return values `result` and `err`.
+	// NOTE: we dereference the DeepCopy of the status field because status fields are NOT pointers,
+	//       so otherwise the `equality.Semantic.DeepEqual` will always return false.
+	currentStatus := *externalSecret.Status.DeepCopy()
+	defer func() {
+		if !equality.Semantic.DeepEqual(currentStatus, externalSecret.Status) {
+			if updateErr := r.Status().Update(ctx, externalSecret); updateErr != nil {
+				if apierrors.IsConflict(updateErr) {
+					log.Info("conflict while updating status, will requeue")
+					result = ctrl.Result{Requeue: true}
+					return
+				}
+				log.Error(updateErr, errUpdateStatus)
+				if err == nil {
+					err = updateErr
+				} else {
+					err = fmt.Errorf("%w: %v", updateErr, err)
+				}
+			}
+		}
+	}()
 
 	dataMap, err := r.getProviderSecretData(ctx, externalSecret)
 	if err != nil {
@@ -316,8 +319,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 			if err == nil {
 				delErr := deleteOrphanedSecrets(ctx, r.Client, externalSecret, secretName)
 				if delErr != nil {
-					msg := fmt.Sprintf("failed to clean up orphaned secrets: %v", delErr)
-					r.markAsFailed(log, msg, delErr, externalSecret, syncCallsError.With(resourceLabels))
+					r.markAsFailed(log, errDeleteOrphaned, delErr, externalSecret, syncCallsError.With(resourceLabels))
 					return ctrl.Result{}, delErr
 				}
 			}
@@ -342,8 +344,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 }
 
 // getRequeueResult create a result with requeueAfter based on the ExternalSecret refresh interval.
-// this should be used when the ExternalSecret has been SUCCESSFULLY reconciled,
-// and ONLY AFTER `markAsDone()` has been called.
 func (r *Reconciler) getRequeueResult(externalSecret *esv1beta1.ExternalSecret) ctrl.Result {
 	// default to the global requeue interval
 	// note, this will never be used because the CRD has a default value of 1 hour
@@ -404,7 +404,6 @@ func (r *Reconciler) markAsDone(externalSecret *esv1beta1.ExternalSecret, start 
 }
 
 func (r *Reconciler) markAsFailed(log logr.Logger, msg string, err error, externalSecret *esv1beta1.ExternalSecret, counter prometheus.Counter) {
-	log.Error(err, msg)
 	r.recorder.Event(externalSecret, v1.EventTypeWarning, esv1beta1.ReasonUpdateFailed, err.Error())
 	conditionSynced := NewExternalSecretCondition(esv1beta1.ExternalSecretReady, v1.ConditionFalse, esv1beta1.ConditionReasonSecretSyncedError, msg)
 	SetExternalSecretCondition(externalSecret, *conditionSynced)
