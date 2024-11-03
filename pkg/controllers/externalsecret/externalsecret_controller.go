@@ -692,20 +692,9 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options)
 	}
 
 	// predicate function to ignore secret events unless they have our data-hash annotation
-	// and the data-hash is out of date
 	secretHasESAnnotation := predicate.NewPredicateFuncs(func(object client.Object) bool {
-		secret, ok := object.(*v1.Secret)
-		if !ok {
-			return false
-		}
-		dataHash, annotationExists := secret.GetAnnotations()[esv1beta1.AnnotationDataHash]
-		if !annotationExists {
-			// if the annotation does not exist, we don't manage this secret
-			return false
-		} else {
-			// if the annotation exists, but the hash is different, we need to reconcile
-			return dataHash != utils.ObjectHash(secret.Data)
-		}
+		_, hasAnnotation := object.GetAnnotations()[esv1beta1.AnnotationDataHash]
+		return hasAnnotation
 	})
 
 	return ctrl.NewControllerManagedBy(mgr).
