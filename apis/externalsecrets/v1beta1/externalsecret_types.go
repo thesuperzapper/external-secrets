@@ -470,13 +470,14 @@ type ExternalSecret struct {
 }
 
 const (
-	// AnnotationDataHash all secrets managed by an ExternalSecret have this annotation with the hash of their data
+	// AnnotationDataHash all secrets managed by an ExternalSecret have this annotation with the hash of their data.
 	AnnotationDataHash = "reconcile.external-secrets.io/data-hash"
 
-	// LabelManaged all secrets managed by an ExternalSecret will have this label equal to "true"
-	LabelManaged = "reconcile.external-secrets.io/managed"
+	// LabelManaged all secrets managed by an ExternalSecret will have this label equal to "true".
+	LabelManaged      = "reconcile.external-secrets.io/managed"
+	LabelManagedValue = "true"
 
-	// LabelOwner points to the owning ExternalSecret resource when CreationPolicy=Owner
+	// LabelOwner points to the owning ExternalSecret resource when CreationPolicy=Owner.
 	LabelOwner = "reconcile.external-secrets.io/created-by"
 )
 

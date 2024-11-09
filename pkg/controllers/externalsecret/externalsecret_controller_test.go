@@ -105,7 +105,7 @@ var _ = Describe("Kind=secret existence logic", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					UID: "xxx",
 					Labels: map[string]string{
-						esv1beta1.LabelManaged: "true",
+						esv1beta1.LabelManaged: esv1beta1.LabelManagedValue,
 					},
 					Annotations: map[string]string{},
 				},
@@ -118,7 +118,7 @@ var _ = Describe("Kind=secret existence logic", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					UID: "xxx",
 					Labels: map[string]string{
-						esv1beta1.LabelManaged: "true",
+						esv1beta1.LabelManaged: esv1beta1.LabelManagedValue,
 					},
 					Annotations: map[string]string{
 						esv1beta1.AnnotationDataHash: "xxxxxx",
@@ -133,7 +133,7 @@ var _ = Describe("Kind=secret existence logic", func() {
 				ObjectMeta: metav1.ObjectMeta{
 					UID: "xxx",
 					Labels: map[string]string{
-						esv1beta1.LabelManaged: "true",
+						esv1beta1.LabelManaged: esv1beta1.LabelManagedValue,
 					},
 					Annotations: map[string]string{
 						esv1beta1.AnnotationDataHash: utils.ObjectHash(validData),
@@ -452,7 +452,7 @@ var _ = Describe("ExternalSecret controller", Serial, func() {
 			Expect(secret.ObjectMeta.Labels).To(HaveLen(3))
 			Expect(secret.ObjectMeta.Labels).To(HaveKeyWithValue("existing-label-key", "existing-label-value"))
 			Expect(secret.ObjectMeta.Labels).To(HaveKeyWithValue("es-label-key", "es-label-value"))
-			Expect(secret.ObjectMeta.Labels).To(HaveKeyWithValue(esv1beta1.LabelManaged, "true"))
+			Expect(secret.ObjectMeta.Labels).To(HaveKeyWithValue(esv1beta1.LabelManaged, esv1beta1.LabelManagedValue))
 
 			Expect(secret.ObjectMeta.Annotations).To(HaveLen(3))
 			Expect(secret.ObjectMeta.Annotations).To(HaveKeyWithValue("existing-annotation-key", "existing-annotation-value"))
