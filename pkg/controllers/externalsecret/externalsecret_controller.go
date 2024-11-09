@@ -204,12 +204,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	// if the secret exists but does not have the "managed" label, add the label
 	// using a PATCH so it is visible in the cache, then requeue immediately
 	if secretPartial.UID != "" && secretPartial.Labels[esv1beta1.LabelManaged] != "true" {
+		fqdn := fmt.Sprintf(fieldOwnerTemplate, externalSecret.Name)
 		patch := client.MergeFrom(secretPartial.DeepCopy())
 		if secretPartial.Labels == nil {
 			secretPartial.Labels = make(map[string]string)
 		}
 		secretPartial.Labels[esv1beta1.LabelManaged] = "true"
-		err = r.Patch(ctx, secretPartial, patch)
+		err = r.Patch(ctx, secretPartial, patch, client.FieldOwner(fqdn))
 		if err != nil {
 			log.Error(err, errPatchExistingSecret)
 			syncCallsError.With(resourceLabels).Inc()
