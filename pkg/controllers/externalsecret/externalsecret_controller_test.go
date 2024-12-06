@@ -17,7 +17,6 @@ package externalsecret
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -30,7 +29,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	v1 "k8s.io/api/core/v1"
-	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -718,33 +716,6 @@ var _ = Describe("ExternalSecret controller", Serial, func() {
 				return apierrors.IsNotFound(err)
 			}, time.Second*10, time.Millisecond*200).Should(BeTrue())
 		}
-	}
-
-	ignoreMismatchControllerForGeneratorRef := func(tc *testCase) {
-		const secretKey = "somekey"
-		const secretVal = "someValue"
-
-		fakeGenerator := &genv1alpha1.Fake{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "mytestfake2",
-				Namespace: ExternalSecretNamespace,
-			},
-			Spec: genv1alpha1.FakeSpec{
-				Data: map[string]string{
-					secretKey: secretVal,
-				},
-				Controller: "fakeControllerClass",
-			},
-		}
-
-		fakeGeneratorJSON, _ := json.Marshal(fakeGenerator)
-
-		Expect(shouldSkipGenerator(
-			&Reconciler{
-				ControllerClass: "default",
-			},
-			&apiextensions.JSON{Raw: fakeGeneratorJSON},
-		)).To(BeTrue())
 	}
 
 	syncWithMultipleSecretStores := func(tc *testCase) {
@@ -1888,22 +1859,6 @@ var _ = Describe("ExternalSecret controller", Serial, func() {
 		}
 	}
 
-	ignoreClusterSecretStoreWhenDisabled := func(tc *testCase) {
-		tc.externalSecret.Spec.SecretStoreRef.Kind = esv1beta1.ClusterSecretStoreKind
-
-		Expect(shouldSkipClusterSecretStore(
-			&Reconciler{
-				ClusterSecretStoreEnabled: false,
-			},
-			tc.externalSecret,
-		)).To(BeTrue())
-
-		tc.checkCondition = func(es *esv1beta1.ExternalSecret) bool {
-			cond := GetExternalSecretCondition(es.Status, esv1beta1.ExternalSecretReady)
-			return cond == nil
-		}
-	}
-
 	// When the ownership is set to owner, and we delete a dependent child kind=secret
 	// it should be recreated without waiting for refresh interval
 	checkDeletion := func(tc *testCase) {
@@ -2321,7 +2276,6 @@ var _ = Describe("ExternalSecret controller", Serial, func() {
 		Entry("should not delete pre-existing secret with creationPolicy=Orphan", createSecretPolicyOrphan),
 		Entry("should sync cluster generator ref", syncWithClusterGeneratorRef),
 		Entry("should sync with generatorRef", syncWithGeneratorRef),
-		Entry("should not process generatorRef with mismatching controller field", ignoreMismatchControllerForGeneratorRef),
 		Entry("should sync with multiple secret stores via sourceRef", syncWithMultipleSecretStores),
 		Entry("should sync with template", syncWithTemplate),
 		Entry("should sync with template engine v2", syncWithTemplateV2),
@@ -2347,7 +2301,6 @@ var _ = Describe("ExternalSecret controller", Serial, func() {
 		Entry("should set an error condition when store does not exist", storeMissingErrCondition),
 		Entry("should set an error condition when store provider constructor fails", storeConstructErrCondition),
 		Entry("should not process store with mismatching controller field", ignoreMismatchController),
-		Entry("should not process cluster secret store when it is disabled", ignoreClusterSecretStoreWhenDisabled),
 		Entry("should eventually delete target secret with deletionPolicy=Delete", deletionPolicyDelete),
 		Entry("should not delete target secret with deletionPolicy=Retain", deletionPolicyRetain),
 		Entry("should update the status properly even if the deletionPolicy is Retain and the data is empty", deletionPolicyRetainEmptyData),

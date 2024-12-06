@@ -30,12 +30,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/selection"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
@@ -45,20 +43,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
-	// Metrics.
 	"github.com/external-secrets/external-secrets/pkg/controllers/externalsecret/esmetrics"
 	ctrlmetrics "github.com/external-secrets/external-secrets/pkg/controllers/metrics"
 	"github.com/external-secrets/external-secrets/pkg/utils"
-	"github.com/external-secrets/external-secrets/pkg/utils/resolvers"
 
-	// Loading registered generators.
+	// Loading registered generators and providers.
 	_ "github.com/external-secrets/external-secrets/pkg/generator/register"
-	// Loading registered providers.
 	_ "github.com/external-secrets/external-secrets/pkg/provider/register"
 )
 
@@ -76,13 +69,16 @@ const (
 	msgMissing = "secret will not be created due to CreationPolicy=Merge"
 
 	// condition messages for "SecretSyncedError" reason.
-	msgErrorGetSecretData   = "could not get secret data from provider"
-	msgErrorDeleteSecret    = "could not delete secret"
-	msgErrorDeleteOrphaned  = "could not delete orphaned secrets"
-	msgErrorUpdateSecret    = "could not update secret"
-	msgErrorUpdateImmutable = "could not update secret, target is immutable"
-	msgErrorBecomeOwner     = "failed to take ownership of target secret"
-	msgErrorIsOwned         = "target is owned by another ExternalSecret"
+	msgErrorGetSecretData       = "could not get secret data from provider (see events for details)"
+	msgErrorDeleteSecret        = "could not delete secret (see events for details)"
+	msgErrorDeleteOrphaned      = "could not delete orphaned secrets (see events for details)"
+	msgErrorUpdateSecret        = "could not update secret (see events for details)"
+	msgErrorUpdateImmutable     = "could not update secret, target is immutable"
+	msgErrorBecomeOwner         = "failed to take ownership of target secret (see events for details)"
+	msgErrorIsOwned             = "target is owned by another ExternalSecret (see events for details)"
+	msgErrorSourcesNotExists    = "some data sources do not exist (see events for details)"
+	msgErrorSourcesNotReady     = "some data sources are not ready (see events for details)"
+	msgErrorDefaultStoreMissing = "default store is missing (spec.secretStoreRef), but some entries omit store references (spec.data[] or spec.dataFrom[])"
 
 	// log messages.
 	logErrorGetES                = "unable to get ExternalSecret"
@@ -106,14 +102,18 @@ const (
 	errUpdateNotFound        = "unable to update secret %s: not found"
 	errDeleteCreatePolicy    = "unable to delete secret %s: creationPolicy=%s is not Owner"
 	errSecretCachesNotSynced = "controller caches for secret %s are not in sync"
+	errSourcesNotExists      = "some referenced data sources do not exist: %v"
+	errSourcesNotReady       = "some referenced data sources are not ready: %v"
+	errDefaultStoreMissing   = "default store is missing (spec.secretStoreRef), but some entries omit store references (spec.data[] or spec.dataFrom[])"
 
 	// event messages.
-	eventCreated                  = "secret created"
-	eventUpdated                  = "secret updated"
-	eventDeleted                  = "secret deleted due to DeletionPolicy=Delete"
-	eventDeletedOrphaned          = "secret deleted because it was orphaned"
-	eventMissingProviderSecret    = "secret does not exist at provider using spec.dataFrom[%d]"
-	eventMissingProviderSecretKey = "secret does not exist at provider using spec.dataFrom[%d] (key=%s)"
+	eventCreated                      = "secret created"
+	eventUpdated                      = "secret updated"
+	eventDeleted                      = "secret deleted due to DeletionPolicy=Delete"
+	eventDeletedOrphaned              = "secret deleted because it was orphaned"
+	eventMissingProviderSecretFrom    = "secret does not exist at provider using spec.dataFrom[%d]"
+	eventMissingProviderSecretFromKey = "secret does not exist at provider using spec.dataFrom[%d] (key=%s)"
+	eventMissingProviderSecretData    = "secret does not exist at provider using spec.data[%d] (key=%s)"
 )
 
 // these errors are explicitly defined so we can detect them with `errors.Is()`.
@@ -125,19 +125,21 @@ var (
 )
 
 const indexESTargetSecretNameField = ".metadata.targetSecretName"
+const indexESTriggerSecretsField = ".metadata.triggerSecrets"
 
 // Reconciler reconciles a ExternalSecret object.
 type Reconciler struct {
 	client.Client
-	SecretClient              client.Client
-	Log                       logr.Logger
-	Scheme                    *runtime.Scheme
-	RestConfig                *rest.Config
-	ControllerClass           string
-	RequeueInterval           time.Duration
-	ClusterSecretStoreEnabled bool
-	EnableFloodGate           bool
-	recorder                  record.EventRecorder
+	SecretClient                  client.Client
+	Log                           logr.Logger
+	Scheme                        *runtime.Scheme
+	RestConfig                    *rest.Config
+	ControllerClass               string
+	RequeueInterval               time.Duration
+	ClusterSecretStoreEnabled     bool
+	EnableFloodGate               bool
+	EnableTriggerInClusterSecrets bool
+	recorder                      record.EventRecorder
 }
 
 // Reconcile implements the main reconciliation loop
@@ -190,20 +192,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	resourceLabels = ctrlmetrics.RefineLabels(resourceLabels, externalSecret.Labels)
 
 	// skip this ExternalSecret if it uses a ClusterSecretStore and the feature is disabled
-	if shouldSkipClusterSecretStore(r, externalSecret) {
+	if r.shouldSkipClusterSecretStore(externalSecret) {
 		log.V(1).Info("skipping ExternalSecret, ClusterSecretStore feature is disabled")
 		return ctrl.Result{}, nil
 	}
 
 	// skip this ExternalSecret if it uses any SecretStore not managed by this controller
-	skip, err := shouldSkipUnmanagedStore(ctx, req.Namespace, r, externalSecret)
+	// NOTE: we capture information about some sync errors but do not act on them until
+	//       later in the reconciliation so we can update the status of the ExternalSecret
+	//       (notExistSources, notReadySources, defaultStoreMissing)
+	skip, sourcesResult, err := r.getDataSourcesOrSkip(ctx, externalSecret)
 	if err != nil {
 		log.Error(err, logErrorUnmanagedStore)
 		syncCallsError.With(resourceLabels).Inc()
 		return ctrl.Result{}, err
 	}
 	if skip {
-		log.V(1).Info("skipping ExternalSecret, uses unmanaged SecretStore")
+		log.V(1).Info("skipping ExternalSecret, it uses unmanaged SecretStores or Generators")
 		return ctrl.Result{}, nil
 	}
 
@@ -291,6 +296,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 	//       so otherwise the `equality.Semantic.DeepEqual` will always return false.
 	currentStatus := *externalSecret.Status.DeepCopy()
 	defer func() {
+		// use the ssInfoMap and cssInfoMap to update the sources and triggers in the status
+		r.updateStatusSourcesAndTriggers(externalSecret, sourcesResult.ssInfoMap, sourcesResult.cssInfoMap)
+
 		// if the status has not changed, we don't need to update it
 		if equality.Semantic.DeepEqual(currentStatus, externalSecret.Status) {
 			return
@@ -324,8 +332,29 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ct
 		}
 	}()
 
+	// handle errors we detected before this point
+	// NOTE: we were holding on to these errors as before this point, we were
+	//       still determining if we should be doing a sync or not, so could not
+	//       update the status of the ExternalSecret.
+	if sourcesResult.defaultStoreMissing {
+		// NOTE: this error cant be fixed by retrying so we don't return an error (which would requeue immediately)
+		err = errors.New(errDefaultStoreMissing)
+		r.markAsFailed(msgErrorDefaultStoreMissing, err, externalSecret, syncCallsError.With(resourceLabels))
+		return ctrl.Result{}, nil
+	}
+	if len(sourcesResult.notExistSources) > 0 {
+		err = fmt.Errorf(errSourcesNotExists, sourcesResult.notExistSources)
+		r.markAsFailed(msgErrorSourcesNotExists, err, externalSecret, syncCallsError.With(resourceLabels))
+		return ctrl.Result{}, err
+	}
+	if r.EnableFloodGate && len(sourcesResult.notReadySources) > 0 {
+		err = fmt.Errorf(errSourcesNotReady, sourcesResult.notReadySources)
+		r.markAsFailed(msgErrorSourcesNotReady, err, externalSecret, syncCallsError.With(resourceLabels))
+		return ctrl.Result{}, err
+	}
+
 	// retrieve the provider secret data.
-	dataMap, err := r.getProviderSecretData(ctx, externalSecret)
+	dataMap, err := r.getProviderSecretData(ctx, externalSecret, sourcesResult.ssInfoMap, sourcesResult.cssInfoMap)
 	if err != nil {
 		r.markAsFailed(msgErrorGetSecretData, err, externalSecret, syncCallsError.With(resourceLabels))
 		return ctrl.Result{}, err
@@ -570,6 +599,91 @@ func (r *Reconciler) getRequeueResult(externalSecret *esv1beta1.ExternalSecret) 
 	return ctrl.Result{Requeue: true}
 }
 
+// updateStatusSourcesAndTriggers updates the status of the ExternalSecret with the data sources and triggers.
+func (r *Reconciler) updateStatusSourcesAndTriggers(externalSecret *esv1beta1.ExternalSecret, ssInfoMap, cssInfoMap map[string]*StoreInfo) {
+	// create a map to track the in-cluster trigger secrets we have found (for kubernetes providers)
+	foundTriggerSecrets := make(map[esv1beta1.TriggerInClusterSecret]bool)
+
+	// convert the SecretStore map into a slice of ProviderSourceInfo
+	ssProviderSources := make([]esv1beta1.ProviderSourceInfo, 0, len(ssInfoMap))
+	for storeName, storeInfo := range ssInfoMap {
+		sourceInfo := r.storeInfoToProviderSource(storeName, storeInfo, foundTriggerSecrets)
+		ssProviderSources = append(ssProviderSources, sourceInfo)
+	}
+
+	// convert the ClusterSecretStore map into a slice of ProviderSourceInfo
+	cssProviderSources := make([]esv1beta1.ProviderSourceInfo, 0, len(cssInfoMap))
+	for storeName, storeInfo := range cssInfoMap {
+		sourceInfo := r.storeInfoToProviderSource(storeName, storeInfo, foundTriggerSecrets)
+		cssProviderSources = append(cssProviderSources, sourceInfo)
+	}
+
+	// convert the foundTriggerSecrets map into a slice of TriggerInClusterSecret
+	triggerSecretsSlice := make([]esv1beta1.TriggerInClusterSecret, 0, len(foundTriggerSecrets))
+	for triggerSecret := range foundTriggerSecrets {
+		triggerSecretsSlice = append(triggerSecretsSlice, triggerSecret)
+	}
+
+	// update the status of the ExternalSecret
+	externalSecret.Status.Sources = esv1beta1.ExternalSecretStatusSources{
+		SecretStores:        ssProviderSources,
+		ClusterSecretStores: cssProviderSources,
+	}
+	externalSecret.Status.Triggers = esv1beta1.ExternalSecretStatusTriggers{
+		InClusterSecrets: triggerSecretsSlice,
+	}
+}
+
+// storeInfoToProviderSource converts a StoreInfo to a ProviderSourceInfo and updates the foundTriggerSecrets map.
+func (r *Reconciler) storeInfoToProviderSource(storeName string, storeInfo *StoreInfo, foundTriggerSecrets map[esv1beta1.TriggerInClusterSecret]bool) esv1beta1.ProviderSourceInfo {
+	// convert the listedKeys map to a slice
+	listedKeys := make([]string, 0, len(storeInfo.ListedKeys))
+	for key := range storeInfo.ListedKeys {
+		listedKeys = append(listedKeys, key)
+
+		// if this is an in-cluster kubernetes provider, add these keys to the trigger secrets
+		if r.EnableTriggerInClusterSecrets && storeInfo.InClusterKubernetesNamespace != "" {
+			triggerSecret := esv1beta1.TriggerInClusterSecret{
+				Name:      key,
+				Namespace: storeInfo.InClusterKubernetesNamespace,
+			}
+			foundTriggerSecrets[triggerSecret] = true
+		}
+	}
+
+	// convert the foundKeys map to a slice
+	foundKeys := make([]string, 0, len(storeInfo.FoundKeys))
+	for key := range storeInfo.FoundKeys {
+		foundKeys = append(foundKeys, key)
+
+		// if this is an in-cluster kubernetes provider, add these keys to the trigger secrets
+		if r.EnableTriggerInClusterSecrets && storeInfo.InClusterKubernetesNamespace != "" {
+			triggerSecret := esv1beta1.TriggerInClusterSecret{
+				Name:      key,
+				Namespace: storeInfo.InClusterKubernetesNamespace,
+			}
+			foundTriggerSecrets[triggerSecret] = true
+		}
+	}
+
+	providerInfo := esv1beta1.ProviderSourceInfo{
+		Name:       storeName,
+		ListedKeys: listedKeys,
+		FoundKeys:  foundKeys,
+	}
+
+	// set the NotExists and NotReady flags if they are true
+	// NOTE: we set them conditionally so that false values are not serialized to the status to save space
+	if storeInfo.NotExists {
+		providerInfo.NotExists = true
+	}
+	if storeInfo.NotReady {
+		providerInfo.NotReady = true
+	}
+
+	return providerInfo
+}
+
 func (r *Reconciler) markAsDone(externalSecret *esv1beta1.ExternalSecret, start time.Time, log logr.Logger, reason, msg string) {
 	oldReadyCondition := GetExternalSecretCondition(externalSecret.Status, esv1beta1.ExternalSecretReady)
 	newReadyCondition := NewExternalSecretCondition(esv1beta1.ExternalSecretReady, v1.ConditionTrue, reason, msg)
@@ -792,85 +906,6 @@ func hashMeta(m metav1.ObjectMeta) string {
 	return utils.ObjectHash(objectMeta)
 }
 
-func shouldSkipClusterSecretStore(r *Reconciler, es *esv1beta1.ExternalSecret) bool {
-	return !r.ClusterSecretStoreEnabled && es.Spec.SecretStoreRef.Kind == esv1beta1.ClusterSecretStoreKind
-}
-
-// shouldSkipUnmanagedStore iterates over all secretStore references in the externalSecret spec,
-// fetches the store and evaluates the controllerClass property.
-// Returns true if any storeRef points to store with a non-matching controllerClass.
-func shouldSkipUnmanagedStore(ctx context.Context, namespace string, r *Reconciler, es *esv1beta1.ExternalSecret) (bool, error) {
-	var storeList []esv1beta1.SecretStoreRef
-
-	if es.Spec.SecretStoreRef.Name != "" {
-		storeList = append(storeList, es.Spec.SecretStoreRef)
-	}
-
-	for _, ref := range es.Spec.Data {
-		if ref.SourceRef != nil {
-			storeList = append(storeList, ref.SourceRef.SecretStoreRef)
-		}
-	}
-
-	for _, ref := range es.Spec.DataFrom {
-		if ref.SourceRef != nil && ref.SourceRef.SecretStoreRef != nil {
-			storeList = append(storeList, *ref.SourceRef.SecretStoreRef)
-		}
-
-		// verify that generator's controllerClass matches
-		if ref.SourceRef != nil && ref.SourceRef.GeneratorRef != nil {
-			_, obj, err := resolvers.GeneratorRef(ctx, r.Client, r.Scheme, namespace, ref.SourceRef.GeneratorRef)
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					// skip non-existent generators
-					continue
-				}
-				if errors.Is(err, resolvers.ErrUnableToGetGenerator) {
-					// skip generators that we can't get (e.g. due to being invalid)
-					continue
-				}
-				return false, err
-			}
-			skipGenerator, err := shouldSkipGenerator(r, obj)
-			if err != nil {
-				return false, err
-			}
-			if skipGenerator {
-				return true, nil
-			}
-		}
-	}
-
-	for _, ref := range storeList {
-		var store esv1beta1.GenericStore
-
-		switch ref.Kind {
-		case esv1beta1.SecretStoreKind, "":
-			store = &esv1beta1.SecretStore{}
-		case esv1beta1.ClusterSecretStoreKind:
-			store = &esv1beta1.ClusterSecretStore{}
-			namespace = ""
-		}
-
-		err := r.Get(ctx, types.NamespacedName{
-			Name:      ref.Name,
-			Namespace: namespace,
-		}, store)
-		if err != nil {
-			if apierrors.IsNotFound(err) {
-				// skip non-existent stores
-				continue
-			}
-			return false, err
-		}
-		class := store.GetSpec().Controller
-		if class != "" && class != r.ControllerClass {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
 func shouldRefresh(es *esv1beta1.ExternalSecret) bool {
 	// if the refresh interval is 0, and we have synced previously, we should not refresh
 	if es.Spec.RefreshInterval.Duration <= 0 && es.Status.SyncedResourceVersion != "" {
@@ -935,11 +970,24 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options)
 		return err
 	}
 
-	// predicate function to ignore secret events unless they have the "managed" label
-	secretHasESLabel := predicate.NewPredicateFuncs(func(object client.Object) bool {
-		value, hasLabel := object.GetLabels()[esv1beta1.LabelManaged]
-		return hasLabel && value == esv1beta1.LabelManagedValue
-	})
+	// index ExternalSecrets based on the in-cluster secret triggers
+	// this lets us quickly find all ExternalSecrets which should be reconciled when a secret changes
+	if r.EnableTriggerInClusterSecrets {
+		if err := mgr.GetFieldIndexer().IndexField(context.Background(), &esv1beta1.ExternalSecret{}, indexESTriggerSecretsField, func(obj client.Object) []string {
+			es := obj.(*esv1beta1.ExternalSecret)
+
+			// convert the in-cluster secret triggers in the status to a list of index values
+			// with the format `<SECRET_NAMESPACE>/<SECRET_NAME>`
+			indexValues := make([]string, len(es.Status.Triggers.InClusterSecrets))
+			for i, trigger := range es.Status.Triggers.InClusterSecrets {
+				indexValues[i] = fmt.Sprintf("%s/%s", trigger.Namespace, trigger.Name)
+			}
+
+			return indexValues
+		}); err != nil {
+			return err
+		}
+	}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		WithOptions(opts).
@@ -948,33 +996,10 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options)
 		// we use WatchesMetadata() to reduce memory usage, as otherwise we have to process full secret objects.
 		WatchesMetadata(
 			&v1.Secret{},
-			handler.EnqueueRequestsFromMapFunc(r.findObjectsForSecret),
-			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}, secretHasESLabel),
+			r.secretEventHandler(),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{}),
 		).
 		Complete(r)
-}
-
-func (r *Reconciler) findObjectsForSecret(ctx context.Context, secret client.Object) []reconcile.Request {
-	externalSecretsList := &esv1beta1.ExternalSecretList{}
-	listOps := &client.ListOptions{
-		FieldSelector: fields.OneTermEqualSelector(indexESTargetSecretNameField, secret.GetName()),
-		Namespace:     secret.GetNamespace(),
-	}
-	err := r.List(ctx, externalSecretsList, listOps)
-	if err != nil {
-		return []reconcile.Request{}
-	}
-
-	requests := make([]reconcile.Request, len(externalSecretsList.Items))
-	for i, item := range externalSecretsList.Items {
-		requests[i] = reconcile.Request{
-			NamespacedName: types.NamespacedName{
-				Name:      item.GetName(),
-				Namespace: item.GetNamespace(),
-			},
-		}
-	}
-	return requests
 }
 
 func BuildManagedSecretClient(mgr ctrl.Manager) (client.Client, error) {

@@ -256,7 +256,7 @@ func (r *Reconciler) DeleteSecretFromProviders(ctx context.Context, ps *esapi.Pu
 			Name: strings.Split(storeName, "/")[1],
 			Kind: strings.Split(storeName, "/")[0],
 		}
-		client, err := mgr.Get(ctx, storeRef, ps.Namespace, nil)
+		_, client, err := mgr.Get(ctx, storeRef, ps.Namespace, nil)
 		if err != nil {
 			return out, fmt.Errorf("could not get secrets client for store %v: %w", storeName, err)
 		}
@@ -316,7 +316,7 @@ func (r *Reconciler) handlePushSecretDataForStore(ctx context.Context, ps esapi.
 		Kind: refKind,
 	}
 	originalSecretData := secret.Data
-	secretClient, err := mgr.Get(ctx, storeRef, ps.GetNamespace(), nil)
+	_, secretClient, err := mgr.Get(ctx, storeRef, ps.GetNamespace(), nil)
 	if err != nil {
 		return out, fmt.Errorf("could not get secrets client for store %v: %w", storeName, err)
 	}
