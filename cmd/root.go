@@ -306,7 +306,7 @@ func init() {
 	rootCmd.Flags().DurationVar(&storeRequeueInterval, "store-requeue-interval", time.Minute*5, "Default Time duration between reconciling (Cluster)SecretStores")
 	rootCmd.Flags().BoolVar(&enableFloodGate, "enable-flood-gate", true, "Enable flood gate. External secret will be reconciled only if the ClusterStore or Store have an healthy or unknown state.")
 	rootCmd.Flags().BoolVar(&enableExtendedMetricLabels, "enable-extended-metric-labels", false, "Enable recommended kubernetes annotations as labels in metrics.")
-	rootCmd.Flags().BoolVar(&enableTriggerInClusterSecrets, "trigger-in-cluster-secrets", false, "If ExternalSecrets should be automatically refreshed when a secret they use via an in-cluster Kubernetes provider is updated.")
+	rootCmd.Flags().BoolVar(&enableTriggerInClusterSecrets, "trigger-in-cluster-secrets", true, "If ExternalSecrets should be automatically refreshed when a secret they use via an in-cluster Kubernetes provider is updated.")
 	fs := feature.Features()
 	for _, f := range fs {
 		rootCmd.Flags().AddFlagSet(f.Flags)
