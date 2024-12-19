@@ -16,6 +16,7 @@ package fake
 
 import (
 	"context"
+	"sync"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -26,57 +27,33 @@ import (
 
 var _ esv1beta1.Provider = &Client{}
 
-type SetSecretCallArgs struct {
+type PushSecretCallArgs struct {
 	Value     []byte
 	RemoteRef esv1beta1.PushSecretRemoteRef
 }
 
 // Client is a fake client for testing.
 type Client struct {
-	SetSecretArgs   map[string]SetSecretCallArgs
-	NewFn           func(context.Context, esv1beta1.GenericStore, client.Client, string) (esv1beta1.SecretsClient, error)
+	// WARNING: only interact with this map using the provided methods so that this is thread-safe.
+	pushedSecrets     map[string]PushSecretCallArgs
+	pushedSecretsLock sync.RWMutex
+
 	GetSecretFn     func(context.Context, esv1beta1.ExternalSecretDataRemoteRef) ([]byte, error)
 	GetSecretMapFn  func(context.Context, esv1beta1.ExternalSecretDataRemoteRef) (map[string][]byte, error)
 	GetAllSecretsFn func(context.Context, esv1beta1.ExternalSecretFind) (map[string][]byte, error)
 	SecretExistsFn  func(context.Context, esv1beta1.PushSecretRemoteRef) (bool, error)
 	SetSecretFn     func() error
 	DeleteSecretFn  func() error
+
+	// NewFn returns the fake client as a SecretsClient interface.
+	NewFn func(context.Context, esv1beta1.GenericStore, client.Client, string) (esv1beta1.SecretsClient, error)
 }
 
 // New returns a fake provider/client.
 func New() *Client {
-	v := &Client{
-		GetSecretFn: func(context.Context, esv1beta1.ExternalSecretDataRemoteRef) ([]byte, error) {
-			return nil, nil
-		},
-		GetSecretMapFn: func(context.Context, esv1beta1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
-			return nil, nil
-		},
-		GetAllSecretsFn: func(context.Context, esv1beta1.ExternalSecretFind) (map[string][]byte, error) {
-			return nil, nil
-		},
-		SecretExistsFn: func(context.Context, esv1beta1.PushSecretRemoteRef) (bool, error) {
-			return false, nil
-		},
-		SetSecretFn: func() error {
-			return nil
-		},
-		DeleteSecretFn: func() error {
-			return nil
-		},
-		SetSecretArgs: map[string]SetSecretCallArgs{},
-	}
-
-	v.NewFn = func(context.Context, esv1beta1.GenericStore, client.Client, string) (esv1beta1.SecretsClient, error) {
-		return v, nil
-	}
-
+	v := &Client{}
+	v.Reset()
 	return v
-}
-
-// RegisterAs registers the fake client in the schema.
-func (v *Client) RegisterAs(provider *esv1beta1.SecretStoreProvider) {
-	esv1beta1.ForceRegister(v, provider)
 }
 
 // GetAllSecrets implements the provider.Provider interface.
@@ -85,11 +62,33 @@ func (v *Client) GetAllSecrets(ctx context.Context, ref esv1beta1.ExternalSecret
 }
 
 func (v *Client) PushSecret(_ context.Context, secret *corev1.Secret, data esv1beta1.PushSecretData) error {
-	v.SetSecretArgs[data.GetRemoteKey()] = SetSecretCallArgs{
+	v.StorePushedSecret(data.GetRemoteKey(), PushSecretCallArgs{
 		Value:     secret.Data[data.GetSecretKey()],
 		RemoteRef: data,
-	}
+	})
 	return v.SetSecretFn()
+}
+
+// ClearPushedSecrets clears the pushed secrets map.
+func (v *Client) ClearPushedSecrets() {
+	v.pushedSecretsLock.Lock()
+	defer v.pushedSecretsLock.Unlock()
+	v.pushedSecrets = make(map[string]PushSecretCallArgs)
+}
+
+// LoadPushedSecret returns the pushed secret for the given remote key.
+func (v *Client) LoadPushedSecret(remoteKey string) (PushSecretCallArgs, bool) {
+	v.pushedSecretsLock.RLock()
+	defer v.pushedSecretsLock.RUnlock()
+	val, ok := v.pushedSecrets[remoteKey]
+	return val, ok
+}
+
+// StorePushedSecret stores the pushed secret for the given remote key.
+func (v *Client) StorePushedSecret(remoteKey string, val PushSecretCallArgs) {
+	v.pushedSecretsLock.Lock()
+	defer v.pushedSecretsLock.Unlock()
+	v.pushedSecrets[remoteKey] = val
 }
 
 func (v *Client) DeleteSecret(_ context.Context, _ esv1beta1.PushSecretRemoteRef) error {
@@ -155,8 +154,7 @@ func (v *Client) WithSetSecret(err error) *Client {
 }
 
 // WithNew wraps the fake provider factory function.
-func (v *Client) WithNew(f func(context.Context, esv1beta1.GenericStore, client.Client,
-	string) (esv1beta1.SecretsClient, error)) *Client {
+func (v *Client) WithNew(f func(context.Context, esv1beta1.GenericStore, client.Client, string) (esv1beta1.SecretsClient, error)) *Client {
 	v.NewFn = f
 	return v
 }
@@ -175,9 +173,45 @@ func (v *Client) NewClient(ctx context.Context, store esv1beta1.GenericStore, ku
 	return c, nil
 }
 
+// Reset the fake provider.
 func (v *Client) Reset() {
-	v.WithNew(func(context.Context, esv1beta1.GenericStore, client.Client,
-		string) (esv1beta1.SecretsClient, error) {
-		return v, nil
-	})
+	// Reset the internal state.
+	v.ClearPushedSecrets()
+
+	// Reset all functions to their default values.
+	v.GetSecretFn = defaultGetSecretFn
+	v.GetSecretMapFn = defaultGetSecretMapFn
+	v.GetAllSecretsFn = defaultGetAllSecretsFn
+	v.SecretExistsFn = defaultSecretExistsFn
+	v.SetSecretFn = defaultSetSecretFn
+	v.DeleteSecretFn = defaultDeleteSecretFn
+	v.NewFn = v.defaultNewFn
+}
+
+func (v *Client) defaultNewFn(context.Context, esv1beta1.GenericStore, client.Client, string) (esv1beta1.SecretsClient, error) {
+	return v, nil
+}
+
+func defaultGetSecretFn(context.Context, esv1beta1.ExternalSecretDataRemoteRef) ([]byte, error) {
+	return nil, nil
+}
+
+func defaultGetSecretMapFn(context.Context, esv1beta1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
+	return nil, nil
+}
+
+func defaultGetAllSecretsFn(context.Context, esv1beta1.ExternalSecretFind) (map[string][]byte, error) {
+	return nil, nil
+}
+
+func defaultSecretExistsFn(context.Context, esv1beta1.PushSecretRemoteRef) (bool, error) {
+	return false, nil
+}
+
+func defaultSetSecretFn() error {
+	return nil
+}
+
+func defaultDeleteSecretFn() error {
+	return nil
 }
